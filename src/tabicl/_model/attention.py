@@ -148,38 +148,65 @@ def multi_head_attention_forward(
     ssmax_layer: Optional[nn.Module] = None,
     need_kv: bool = False,
 ) -> Union[Tensor, Tuple[Tensor, Tensor, Tensor]]:
-    """Multi-head attention with support for rotary position embeddings.
+    """Multi-head attention with RoPE, scalable softmax, and KV caching.
+
+    A functional re-implementation of ``F.multi_head_attention_forward`` that
+    accepts arbitrary leading batch dimensions and adds rotary embeddings,
+    scalable softmax, and KV caching. Like the PyTorch original it takes raw
+    weight *tensors* rather than modules, so the caller
+    (:meth:`layers.MultiheadAttention.forward`) passes them in explicitly.
+
+    ``query``, ``key`` and ``value`` are the three *input sequences*, each of
+    width ``embed_dim``. They are not the Q/K/V of the attention formula; they
+    are what ``in_proj_weight`` projects into them. Throughout this module the
+    spelled-out names denote these pre-projection inputs and the lowercase
+    ``q``/``k``/``v`` the post-projection, head-split tensors. Self-attention
+    passes one tensor for all three; cross-attention (e.g. ``ISAB`` in
+    ``layers.py``) passes different ones. See Notes for the full pipeline.
 
     Parameters
     ----------
     query : Tensor
-        Query tensor of shape (..., tgt_len, embed_dim).
+        Input sequence projected into the queries, shape
+        (..., tgt_len, embed_dim). Its length sets the output length.
 
     num_heads : int
-        Number of attention heads.
+        Number of attention heads. Must divide ``embed_dim``; each head then
+        operates in ``head_dim = embed_dim // num_heads`` dimensions.
 
     in_proj_weight : Tensor
-        Combined weight matrix for Q, K, V input projections.
+        The Q, K and V input projections packed into one matrix of shape
+        (3 * embed_dim, embed_dim), stacked along the output axis as
+        ``[W_q ; W_k ; W_v]``. Packing lets one GEMM compute all three when the
+        input sequences coincide. Each (embed_dim, embed_dim) block is itself
+        every head's projection stacked, which is why the head split is a
+        reshape rather than a separate matmul. ``in_proj_weight[:embed_dim]``
+        recovers ``W_q`` alone -- what the ``cached_kv`` path uses.
 
     in_proj_bias : Tensor
-        Combined bias vector for input projections.
+        Matching packed bias of shape (3 * embed_dim,).
 
     dropout_p : float
-        Dropout probability applied to attention weights.
+        Dropout probability applied to attention weights. Forced to 0.0 when
+        ``training`` is False.
 
     out_proj_weight : Tensor
-        Output projection weight matrix.
+        Output projection of shape (embed_dim, embed_dim), applied after the
+        heads are concatenated back to ``embed_dim``. This is the step that
+        mixes information across heads.
 
     out_proj_bias : Tensor
-        Output projection bias vector.
+        Output projection bias of shape (embed_dim,).
 
     key : Optional[Tensor], default=None
-        Key tensor of shape (..., src_len, embed_dim).
-        Required when ``cached_kv`` is None.
+        Input sequence projected into the keys, shape
+        (..., src_len, embed_dim). Required when ``cached_kv`` is None. Must
+        match ``value`` in shape, since both index the same ``src_len`` source
+        positions; ``src_len`` need not equal ``tgt_len``.
 
     value : Optional[Tensor], default=None
-        Value tensor of shape (..., src_len, embed_dim).
-        Required when ``cached_kv`` is None.
+        Input sequence projected into the values, shape
+        (..., src_len, embed_dim). Required when ``cached_kv`` is None.
 
     cached_kv : Optional[KVCacheEntry], default=None
         Pre-computed key and value projections for caching. When provided:
@@ -201,15 +228,23 @@ def multi_head_attention_forward(
         - For float masks: Values are directly added to attention scores.
 
     attn_mask : Optional[Tensor], default=None
-        Attention mask of shape (tgt_len, src_len) or
-        (..., num_heads, tgt_len, src_len).
+        Additive mask of shape (tgt_len, src_len) or
+        (..., num_heads, tgt_len, src_len); the 2D form is broadcast to the
+        latter. Expected to be a float mask holding ``-inf`` at blocked
+        positions -- the caller converts boolean masks beforehand via
+        ``F._canonical_mask``. Merged with ``key_padding_mask`` by addition.
 
     rope : Optional[RotaryEmbedding]
-        Rotary positional encoding.
+        Rotary position embedding, applied to ``q`` and ``k`` after the head
+        split. Never applied to ``v``: RoPE encodes position through the
+        query-key dot product, and ``v`` never enters one.
 
     ssmax_layer : Optional[nn.Module], default=None
-        If provided, applies scalable softmax (SSMax) scaling to queries before
-        attention computation.
+        Scalable-softmax layer. Rescales ``q`` by a learned, sequence-length
+        dependent factor before attention, which is equivalent to rescaling the
+        logits and lets attention sharpness adapt to ``src_len``. SDPA's own
+        1/sqrt(head_dim) scaling still applies on top. Applied inside
+        :func:`sdpa_with_flattened_batch`, not here.
 
     need_kv : bool, default=False
         If True and ``cached_kv`` is None, also returns the computed K and V
@@ -227,6 +262,33 @@ def multi_head_attention_forward(
             - attn_output: shape (..., tgt_len, embed_dim)
             - k: shape (..., num_heads, src_len, head_dim)
             - v: shape (..., num_heads, src_len, head_dim)
+
+    Notes
+    -----
+    The pass proceeds in six steps:
+
+    1. **In-projection.** ``query``/``key``/``value`` become ``q``/``k``/``v``,
+       still (..., seq_len, embed_dim). ``F._in_projection_packed`` dispatches
+       on object *identity*: one GEMM when ``query is key is value``, two when
+       ``key is value`` (q separately, kv packed), three otherwise. Passing the
+       same tensor object -- not an equal copy -- is what enables the fused
+       path, so callers should preserve identity rather than recompute.
+    2. **Head split.** Reshape to (..., num_heads, seq_len, head_dim). Nothing
+       is computed here; the heads were already laid out side by side in the
+       projection's output.
+    3. **RoPE** on ``q`` and ``k`` only, once they are head-split.
+    4. **Mask assembly.** ``attn_mask`` is validated and broadcast to
+       (..., num_heads, tgt_len, src_len), then ``key_padding_mask`` is added
+       into it. Dropout is disabled outside training.
+    5. **Attention.** :func:`sdpa_with_flattened_batch` collapses the leading
+       batch dims into one (required to trigger Flash Attention), applies SSMax
+       to ``q``, then runs FlashAttention-3 or
+       ``F.scaled_dot_product_attention``.
+    6. **Head concat and out-projection** back to (..., tgt_len, embed_dim).
+
+    When ``cached_kv`` is supplied, steps 1-3 reduce to projecting ``q`` alone
+    through ``in_proj_weight[:embed_dim]``; ``k`` and ``v`` are read from the
+    cache already head-split and already rotated.
     """
 
     # Extract shape information, supporting arbitrary batch dimensions
@@ -235,7 +297,8 @@ def multi_head_attention_forward(
     assert head_dim * num_heads == embed_dim, f"embed_dim {embed_dim} not divisible by num_heads {num_heads}"
 
     if cached_kv is None:
-        # Standard: project Q, K, V jointly
+        # Project the three input sequences into per-head q, k, v. Packed into
+        # one GEMM when query/key/value are the same object (see Notes).
         if key is None or value is None:
             raise ValueError("key and value must be provided when cached_kv is None")
         src_len = key.shape[-2]
@@ -248,7 +311,8 @@ def multi_head_attention_forward(
             q = rope.rotate_queries_or_keys(q)
             k = rope.rotate_queries_or_keys(k)
     else:
-        # Use cached K/V, project Q only
+        # Incremental path: k/v are already projected, head-split and rotated,
+        # so only the query needs projecting -- hence the W_q row slice.
         k, v = cached_kv.key, cached_kv.value
         src_len = k.shape[-2]
         q_proj_weight = in_proj_weight[:embed_dim]
@@ -298,7 +362,7 @@ def multi_head_attention_forward(
         q, k, v, attn_mask, dropout_p, ssmax_layer=ssmax_layer
     )  # (..., nh, tgt_len, hs)
 
-    # Reshape and project output
+    # Concatenate the heads back into embed_dim, then mix across them
     attn_output = attn_output.transpose(-3, -2).contiguous().view(*batch_shape, tgt_len, embed_dim)
     attn_output = F.linear(attn_output, out_proj_weight, out_proj_bias)  # (batch_shape, tgt_len, E)
 

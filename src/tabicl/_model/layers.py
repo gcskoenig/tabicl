@@ -172,6 +172,13 @@ class MultiheadAttention(nn.MultiheadAttention):
     The implementation always uses ``batch_first=True``, so input tensors have
     shape (..., seq_len, embed_dim).
 
+    The projection weights are inherited from ``nn.MultiheadAttention`` and so
+    are not declared here: ``in_proj_weight`` (3 * embed_dim, embed_dim) packs
+    the Q, K and V input projections into one matrix, ``in_proj_bias``
+    (3 * embed_dim,) is its bias, and ``out_proj`` is an
+    ``nn.Linear(embed_dim, embed_dim)``. :meth:`forward` hands all four to
+    :func:`~._model.attention.multi_head_attention_forward` as raw tensors.
+
     References
     ----------
     .. [1] Su et al., "RoFormer: Enhanced Transformer with Rotary Position Embedding"
@@ -203,15 +210,20 @@ class MultiheadAttention(nn.MultiheadAttention):
         Parameters
         ----------
         query : Tensor
-            Query tensor of shape (..., tgt_len, embed_dim).
+            Input sequence projected into the queries, shape
+            (..., tgt_len, embed_dim). This is the sequence *before* the Q
+            projection, not the Q of the attention formula.
 
         key : Optional[Tensor], default=None
-            Key tensor of shape (..., src_len, embed_dim).
-            Required when ``cached_kv`` is None.
+            Input sequence projected into the keys, shape
+            (..., src_len, embed_dim). Required when ``cached_kv`` is None.
 
         value : Optional[Tensor], default=None
-            Value tensor of shape (..., src_len, embed_dim).
-            Required when ``cached_kv`` is None.
+            Input sequence projected into the values, shape
+            (..., src_len, embed_dim). Required when ``cached_kv`` is None.
+            Pass the *same object* as ``key`` (and as ``query``, for
+            self-attention) so the packed input projection collapses to a
+            single GEMM; it dispatches on identity, not equality.
 
         cached_kv : Optional[KVCacheEntry], default=None
             Pre-computed key and value projections for caching. When provided,
@@ -378,15 +390,20 @@ class MultiheadAttentionBlock(nn.TransformerEncoderLayer):
         Parameters
         ----------
         q : Tensor
-            Query tensor of shape (..., tgt_len, d_model).
+            Input sequence projected into the queries, shape
+            (..., tgt_len, d_model) -- the sequence itself, not the projected
+            Q matrix.
 
         k : Optional[Tensor], default=None
-            Key tensor of shape (..., src_len, d_model).
-            If None, uses ``q`` for self-attention.
+            Input sequence projected into the keys, shape
+            (..., src_len, d_model). If None, ``q`` is reused for
+            self-attention (by reference, which keeps the input projection on
+            its single-GEMM path).
 
         v : Optional[Tensor], default=None
-            Value tensor of shape (..., src_len, d_model).
-            If None, uses ``q`` for self-attention.
+            Input sequence projected into the values, shape
+            (..., src_len, d_model). If None, ``q`` is reused for
+            self-attention.
 
         cached_kv : Optional[KVCacheEntry], default=None
             Pre-computed K/V projections for caching. When provided,
@@ -645,7 +662,12 @@ class InducedSelfAttentionBlock(nn.Module):
         if train_size is None:
             hidden = self.multihead_attn1(ind_vectors, src, src)
         else:
-            hidden = self.multihead_attn1(ind_vectors, src[..., :train_size, :], src[..., :train_size, :])
+            # Bind the slice once so key and value are the same object: the packed
+            # input projection dispatches on identity, and two separate slice
+            # expressions would cost an extra GEMM. See the Notes of
+            # ``multi_head_attention_forward``.
+            src_train = src[..., :train_size, :]
+            hidden = self.multihead_attn1(ind_vectors, src_train, src_train)
 
         out = self.multihead_attn2(src, hidden, hidden)
 
@@ -731,7 +753,10 @@ class InducedSelfAttentionBlock(nn.Module):
 
         if store_cache:
             assert train_size is not None, "train_size must be provided when store_cache=True"
-            hidden = self.multihead_attn1(ind_vectors, src[..., :train_size, :], src[..., :train_size, :])
+            # Bind the slice once so key and value are the same object (see
+            # ``induced_attention``).
+            src_train = src[..., :train_size, :]
+            hidden = self.multihead_attn1(ind_vectors, src_train, src_train)
             out, k_proj, v_proj = self.multihead_attn2(src, hidden, hidden, need_kv=True)
             col_cache.kv[block_idx] = KVCacheEntry(key=k_proj, value=v_proj)
 
